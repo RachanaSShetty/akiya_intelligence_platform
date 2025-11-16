@@ -1,0 +1,139 @@
+version: '3.8'
+
+services:
+  # ------------------ POSTGRES (Data Warehouse & Airflow Metadata) ------------------
+  postgres:
+    image: postgis/postgis:13-3.3 # Using PostGIS image for geospatial capabilities
+    container_name: akiya_postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d # This will run our SQL script on first launch
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    networks:
+      - akiya-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ------------------ MINIO (S3-Compatible Data Lake) ------------------
+  minio:
+    image: minio/minio:latest
+    container_name: akiya_minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000" # S3 API Port
+      - "9001:9001" # Web UI Port
+    volumes:
+      - minio-data-volume:/data
+    networks:
+      - akiya-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ------------------ AIRFLOW SERVICES ------------------
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    container_name: akiya_airflow_webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+    user: "${AIRFLOW_UID}:0"
+    networks:
+      - akiya-net
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    container_name: akiya_airflow_scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    user: "${AIRFLOW_UID}:0"
+    networks:
+      - akiya-net
+    command: scheduler
+
+  airflow-init:
+    image: apache/airflow:2.8.1
+    container_name: akiya_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    user: "${AIRFLOW_UID}:0"
+    networks:
+      - akiya-net
+    command: >
+      bash -c "airflow db init &&
+               airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com"
+
+  # ------------------ SPARK SERVICES ------------------
+  spark-master:
+    image: bde2020/spark-master:3.2.0-hadoop3.2
+    container_name: akiya_spark_master
+    ports:
+      - "8081:8080" # Spark Master Web UI
+      - "7077:7077" # Spark Master Port
+    networks:
+      - akiya-net
+
+  spark-worker:
+    image: bde2020/spark-worker:3.2.0-hadoop3.2
+    container_name: akiya_spark_worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    networks:
+      - akiya-net
+
+  # ------------------ DASHBOARD SERVICE ------------------
+  dashboard:
+    build: ./dashboard
+    container_name: akiya_dashboard
+    ports:
+      - "8501:8501"
+    networks:
+      - akiya-net
+
+# ------------------ VOLUMES & NETWORKS ------------------
+volumes:
+  postgres-db-volume:
+  minio-data-volume:
+
+networks:
+  akiya-net:
+    driver: bridge
